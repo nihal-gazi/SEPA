@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GSCv3 Edge Engine</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+</head>
+<body class="bg-slate-900 text-white font-sans antialiased min-h-screen flex flex-col items-center py-10">
+
+    <div class="w-full max-w-2xl bg-slate-800 rounded-xl shadow-2xl p-8 border border-slate-700">
+        <h1 class="text-3xl font-bold mb-2 text-blue-400">GSC Edge Inference</h1>
+        <p class="text-slate-400 mb-6 text-sm">Models loaded directly into RAM. Compute runs on this device's processor.</p>
+
+        <div id="loading" class="mb-6 p-4 rounded-lg bg-blue-900/30 border border-blue-500/50 flex items-center space-x-3 text-blue-300">
+            <svg class="animate-spin h-5 w-5 text-blue-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+            <span id="loadingText">Downloading ONNX Models (Approx ~10MB)...</span>
+        </div>
+
+        <div class="space-y-4">
+            <textarea id="promptInput" rows="3" class="w-full bg-slate-900 border border-slate-600 rounded-lg p-4 text-white focus:ring-2 focus:ring-blue-500 focus:outline-none resize-none disabled:opacity-50" placeholder="Once upon a time, there was a little girl named Lily..."></textarea>
+            
+            <div class="flex justify-between items-center">
+                <div class="flex space-x-4 items-center">
+                    <label class="text-sm text-slate-400">Temp: <span id="tempValue">0.7</span></label>
+                    <input type="range" id="tempSlider" min="0" max="1" step="0.1" value="0.7" class="w-24 accent-blue-500">
+                </div>
+                <button id="generateBtn" disabled class="bg-blue-600 hover:bg-blue-500 disabled:bg-slate-600 disabled:cursor-not-allowed text-white font-bold py-2 px-6 rounded-lg transition-colors">
+                    Generate
+                </button>
+            </div>
+        </div>
+
+        <div class="mt-8">
+            <h3 class="text-sm font-semibold text-slate-400 mb-2 uppercase tracking-wider">Output</h3>
+            <div id="outputBox" class="w-full min-h-[150px] bg-slate-900 border border-slate-700 rounded-lg p-5 leading-relaxed whitespace-pre-wrap"></div>
+        </div>
+    </div>
+
+    <script>
+        // Set execution provider to WASM (runs efficiently in browser CPU)
+        ort.env.wasm.numThreads = Math.max(1, navigator.hardwareConcurrency - 1);
+
+        let sessions = {};
+        let validPairs = {};
+        const SEQ_LEN = 32;
+        const LATENT_LEN = 16;
+        const CODEBOOK_SIZE = 2048;
+
+        // UI Elements
+        const btn = document.getElementById('generateBtn');
+        const input = document.getElementById('promptInput');
+        const output = document.getElementById('outputBox');
+        const loader = document.getElementById('loading');
+        const loaderText = document.getElementById('loadingText');
+        const tempSlider = document.getElementById('tempSlider');
+
+        tempSlider.addEventListener('input', (e) => document.getElementById('tempValue').innerText = e.target.value);
+
+        async function init() {
+            try {
+                loaderText.innerText = "Loading Encoder ONNX...";
+                sessions.encoder = await ort.InferenceSession.create('models/encoder.onnx');
+                
+                loaderText.innerText = "Loading Generator ONNX...";
+                sessions.generator = await ort.InferenceSession.create('models/generator.onnx');
+                
+                loaderText.innerText = "Loading Decoder ONNX...";
+                sessions.decoder = await ort.InferenceSession.create('models/decoder.onnx');
+
+                loaderText.innerText = "Loading Valid Pairs Dictionary...";
+                const res = await fetch('valid_pairs.json');
+                validPairs = await res.json();
+
+                loader.classList.add('hidden');
+                btn.disabled = false;
+                input.value = "A small boy found a shiny red ball in the garden.";
+            } catch (err) {
+                loaderText.innerText = `Error: ${err.message}`;
+                loader.classList.remove('text-blue-300', 'bg-blue-900/30', 'border-blue-500/50');
+                loader.classList.add('text-red-300', 'bg-red-900/30', 'border-red-500/50');
+            }
+        }
+
+        // JS Implementation of Top-P (Nucleus) Sampling
+        function sampleTopP(logitsArray, temp, topP) {
+            if (temp === 0.0) {
+                let max = -Infinity, idx = 0;
+                for (let i = 0; i < logitsArray.length; i++) {
+                    if (logitsArray[i] > max) { max = logitsArray[i]; idx = i; }
+                }
+                return idx;
+            }
+
+            let logits = Array.from(logitsArray).map(l => l / temp);
+            const maxLogit = Math.max(...logits);
+            const exps = logits.map(l => Math.exp(l - maxLogit));
+            const sumExp = exps.reduce((a, b) => a + b, 0);
+            const probs = exps.map(e => e / sumExp);
+
+            let indexed = probs.map((p, i) => ({prob: p, index: i})).sort((a, b) => b.prob - a.prob);
+            
+            let cumSum = 0;
+            let valid = [];
+            for (let item of indexed) {
+                valid.push(item);
+                cumSum += item.prob;
+                if (cumSum > topP) break;
+            }
+
+            let rand = Math.random() * cumSum;
+            let partial = 0;
+            for (let item of valid) {
+                partial += item.prob;
+                if (partial >= rand) return item.index;
+            }
+            return valid[valid.length - 1].index;
+        }
+
+        btn.addEventListener('click', async () => {
+            if (!input.value.trim()) return;
+            btn.disabled = true;
+            input.disabled = true;
+            
+            let currentStory = input.value.trim();
+            output.innerHTML = `<span class="text-blue-400">${currentStory}</span> `;
+            let temp = parseFloat(tempSlider.value);
+
+            try {
+                // Generate 5 sentences
+                for (let sentenceLoop = 0; sentenceLoop < 5; sentenceLoop++) {
+                    
+                    // 1. Tokenize via Backend
+                    const tokRes = await fetch('/api/tokenize', {
+                        method: 'POST', headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({prompt: currentStory})
+                    });
+                    const { tokens } = await tokRes.json();
+                    
+                    // 2. Run ONNX Encoder
+                    let tensorTokens = new ort.Tensor('int64', new BigInt64Array(tokens.map(BigInt)), [1, SEQ_LEN]);
+                    let encResults = await sessions.encoder.run({ 'input_ids': tensorTokens });
+                    let contextIndices = Array.from(encResults.latent_indices.data); // Length: 32 (16x2)
+                    
+                    let genS1 = [], genS2 = [];
+
+                    // 3. Autoregressive Generator Loop in JS!
+                    for (let step = 0; step < LATENT_LEN; step++) {
+                        let currentLength = contextIndices.length / 2;
+                        
+                        // FIX: Pad the context to exactly 32 (LATENT_LEN * 2) to bypass PyTorch Tracing Bug
+                        let paddedIndices = [...contextIndices];
+                        while (paddedIndices.length / 2 < LATENT_LEN * 2) {
+                            paddedIndices.push(0, 0); // Pad with valid dummy zero indices
+                        }
+                        
+                        let ctxTensor = new ort.Tensor('int64', new BigInt64Array(paddedIndices.map(BigInt)), [1, LATENT_LEN * 2, 2]);
+                        
+                        let genResults = await sessions.generator.run({ 'context': ctxTensor });
+                        let logitsData = genResults.logits.data; // Float32Array [1, 32, 2048, 2]
+                        
+                        // Extract last timestep logits
+                        let lastStepOffset = (currentLength - 1) * CODEBOOK_SIZE * 2;
+                        
+                        // ----- THE STRIDED LAYOUT FIX -----
+                        // Extract S1 and S2 logits correctly based on memory layout [c*2] and [c*2 + 1]
+                        let s1Logits = new Float32Array(CODEBOOK_SIZE);
+                        let s2Logits = new Float32Array(CODEBOOK_SIZE);
+                        
+                        for (let c = 0; c < CODEBOOK_SIZE; c++) {
+                            s1Logits[c] = logitsData[lastStepOffset + (c * 2) + 0];
+                            s2Logits[c] = logitsData[lastStepOffset + (c * 2) + 1];
+                        }
+                        
+                        // Stage 1 Sampling
+                        let s1Idx = sampleTopP(s1Logits, temp, 0.90);
+                        
+                        // Stage 2 Masking & Sampling
+                        let allowed = validPairs[s1Idx] || [];
+                        if (allowed.length < CODEBOOK_SIZE) {
+                            let allowedSet = new Set(allowed);
+                            for (let c = 0; c < CODEBOOK_SIZE; c++) {
+                                if (!allowedSet.has(c)) {
+                                    s2Logits[c] = -Infinity;
+                                }
+                            }
+                        }
+                        let s2Idx = sampleTopP(s2Logits, temp, 0.90);
+
+                        genS1.push(s1Idx);
+                        genS2.push(s2Idx);
+                        contextIndices.push(s1Idx, s2Idx);
+
+                        // Slide Window if needed
+                        if (contextIndices.length / 2 > LATENT_LEN * 2) {
+                            contextIndices = contextIndices.slice(-(LATENT_LEN * 2 * 2));
+                        }
+                    }
+
+                    // 4. Decode new latents
+                    let newLatentsFlat = [];
+                    for(let i=0; i<LATENT_LEN; i++) {
+                        newLatentsFlat.push(genS1[i], genS2[i]);
+                    }
+                    let latentsTensor = new ort.Tensor('int64', new BigInt64Array(newLatentsFlat.map(BigInt)), [1, LATENT_LEN, 2]);
+                    let decResults = await sessions.decoder.run({ 'generated_latents': latentsTensor });
+                    
+                    let textLogits = decResults.text_logits.data; // [1, 32, 8057]
+                    let decodedIds = [];
+                    
+                    // Argmax text logits
+                    for (let i = 0; i < SEQ_LEN; i++) {
+                        let offset = i * 8057;
+                        let maxVal = -Infinity, maxIdx = 0;
+                        for (let v = 0; v < 8057; v++) {
+                            if (textLogits[offset + v] > maxVal) { maxVal = textLogits[offset + v]; maxIdx = v; }
+                        }
+                        decodedIds.push(maxIdx);
+                    }
+
+                    // 5. Detokenize via Backend
+                    const detokRes = await fetch('/api/detokenize', {
+                        method: 'POST', headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({decoded_ids: decodedIds})
+                    });
+                    const { text } = await detokRes.json();
+
+                    if (text) {
+                        currentStory += (currentStory.endsWith(" ") ? "" : " ") + text;
+                        output.innerHTML += `<span>${text} </span>`;
+                    }
+                }
+            } catch (err) {
+                console.error(err);
+                output.innerHTML += `<br><span class="text-red-400">Error during generation: ${err.message}</span>`;
+            }
+
+            btn.disabled = false;
+            input.disabled = false;
+        });
+
+        // Start initialization
+        init();
+    </script>
+</body>
+</html>
